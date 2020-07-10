@@ -1,8 +1,12 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -22,7 +26,7 @@ type LogEntry struct {
 }
 
 //投票请求
-type RequestVoteArgs struct {
+type VoteRequest struct {
 	Me           int
 	ElectionTerm int
 	LogIndex     int
@@ -30,13 +34,13 @@ type RequestVoteArgs struct {
 }
 
 //投票rpc返回
-type RequestVoteReply struct {
+type VoteResponse struct {
 	IsAgree     bool
 	CurrentTerm int
 }
 
 //日志复制请求
-type AppendEntries struct {
+type AppendEntriesRequest struct {
 	Me           int
 	Term         int
 	PrevLogTerm  int
@@ -46,7 +50,7 @@ type AppendEntries struct {
 }
 
 //回复日志更新请求
-type RespEntries struct {
+type AppendEntriesResponse struct {
 	Term        int
 	Successed   bool
 	LastApplied int
@@ -81,6 +85,32 @@ type Raft struct {
 //	return raft
 //}
 
+//事件循环
+func (raft *Raft) runLoop(wg *sync.WaitGroup, signalChan chan os.Signal) {
+	(*wg).Add(1)
+	for {
+		select {
+		case msg := <-signalChan:
+			fmt.Println(msg)
+			if msg == syscall.SIGINT || msg == syscall.SIGTERM {
+				(*wg).Done()
+				fmt.Println("exit run loop")
+				goto exitLoop
+			}
+		default:
+			//fmt.Println("no message received")
+		}
+
+	}
+exitLoop:
+	fmt.Println("runLoop exit")
+}
+
 func Run(raft *Raft) {
-	(*raft).runServer()
+	var wg sync.WaitGroup
+	signalChan := make(chan os.Signal, 2)
+	go (*raft).runServer(&wg, signalChan)
+	go (*raft).runLoop(&wg, signalChan)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	wg.Wait()
 }
