@@ -86,31 +86,24 @@ type Raft struct {
 //}
 
 //事件循环
-func (raft *Raft) runLoop(wg *sync.WaitGroup, signalChan chan os.Signal) {
-	(*wg).Add(1)
+func (raft *Raft) runLoop(signalChan chan os.Signal) {
+	fmt.Println("start run loop")
 	for {
 		select {
 		case msg := <-signalChan:
 			fmt.Println(msg)
-			if msg == syscall.SIGINT || msg == syscall.SIGTERM {
-				(*wg).Done()
+			if msg == syscall.SIGINT || msg == syscall.SIGTERM || msg == syscall.SIGKILL {
 				fmt.Println("exit run loop")
-				goto exitLoop
+				return
 			}
 		default:
-			//fmt.Println("no message received")
 		}
-
 	}
-exitLoop:
-	fmt.Println("runLoop exit")
 }
 
 func Run(raft *Raft) {
-	var wg sync.WaitGroup
-	signalChan := make(chan os.Signal, 2)
-	go (*raft).runServer(&wg, signalChan)
-	go (*raft).runLoop(&wg, signalChan)
+	signalChan := make(chan os.Signal)
+	go (*raft).runLoop(signalChan)
+	(*raft).runServer()
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-	wg.Wait()
 }

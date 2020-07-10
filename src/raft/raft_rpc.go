@@ -1,14 +1,10 @@
 package raft
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/rpc"
 	"net/rpc/jsonrpc"
-	"os"
-	"sync"
-	"syscall"
 )
 
 type RaftRpc struct {
@@ -36,8 +32,7 @@ func (raftRpc *RaftRpc) RequestVote(request VoteRequest, response *VoteResponse)
 	return nil
 }
 
-func (raft *Raft) runServer(wg *sync.WaitGroup, signalChan chan os.Signal) {
-	(*wg).Add(1)
+func (raft *Raft) runServer() {
 	raftRpc := new(RaftRpc)
 	err := rpc.Register(raftRpc)
 	if err != nil {
@@ -48,17 +43,7 @@ func (raft *Raft) runServer(wg *sync.WaitGroup, signalChan chan os.Signal) {
 		panic(err)
 	}
 	for {
-		select {
-		case msg := <-signalChan:
-			fmt.Println(msg)
-			if msg == syscall.SIGINT || msg == syscall.SIGTERM {
-				(*wg).Done()
-				fmt.Println("exit run server")
-				goto exitLoop
-			}
-		default:
-		}
-
+		println("accept")
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Println(err)
@@ -66,7 +51,4 @@ func (raft *Raft) runServer(wg *sync.WaitGroup, signalChan chan os.Signal) {
 		}
 		go jsonrpc.ServeConn(conn)
 	}
-exitLoop:
-	fmt.Println("runServer exit")
-
 }
