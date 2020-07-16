@@ -29,21 +29,22 @@ func (raftRpc *RaftRpc) AppendEntries(request AppendEntriesRequest, response *Ap
 
 // 请求选举RPC
 func (raftRpc *RaftRpc) RequestVote(request VoteRequest, response *VoteResponse) error {
+	(*raftRpc).raft.dealRequestVote(request, response)
 	return nil
 }
 
 func (raft *Raft) runServer() {
 	raftRpc := new(RaftRpc)
+	raftRpc.raft = raft
 	err := rpc.Register(raftRpc)
 	if err != nil {
 		panic(err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:8888")
+	listener, err := net.Listen("tcp", raft.peers[raft.curNodeIndex])
 	if err != nil {
 		panic(err)
 	}
 	for {
-		println("accept")
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Println(err)
