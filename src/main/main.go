@@ -25,5 +25,5 @@ func main() {
 	var raftNode *raft.Raft
 	time.Sleep(2 * time.Millisecond)
 	raftNode = raft.Make(peers, curNodeIndex)
-	(*raftNode).Run()
+	raftNode.Run()
 }

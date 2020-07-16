@@ -24,12 +24,13 @@ func (raftRpc *RaftRpc) Calc(params Params, result *int) error {
 
 // 附加日志RPC
 func (raftRpc *RaftRpc) AppendEntries(request AppendEntriesRequest, response *AppendEntriesResponse) error {
+	raftRpc.raft.dealAppendEntries(request, response)
 	return nil
 }
 
 // 请求选举RPC
 func (raftRpc *RaftRpc) RequestVote(request VoteRequest, response *VoteResponse) error {
-	(*raftRpc).raft.dealRequestVote(request, response)
+	raftRpc.raft.dealRequestVote(request, response)
 	return nil
 }
 

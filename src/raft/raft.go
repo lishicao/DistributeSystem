@@ -38,10 +38,10 @@ type LogEntry struct {
 
 //投票请求
 type VoteRequest struct {
-	RequestNode  int
+	CandidateId  int
 	ElectionTerm int
-	LogIndex     int
-	LogTerm      int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //投票rpc返回
@@ -52,7 +52,7 @@ type VoteResponse struct {
 
 //日志复制请求
 type AppendEntriesRequest struct {
-	Me           int
+	LeaderId     int
 	Term         int
 	PrevLogTerm  int
 	PrevLogIndex int
@@ -111,13 +111,13 @@ type Raft struct {
 	curNodeIndex int        // 自己服务编号
 	logs         []LogEntry // 日志存储
 	//logSnapshot     LogSnapshot         //日志快照
-	commitIndex     int           //当前日志提交处
-	lastApplied     int           //当前状态机执行处
-	status          int           //节点状态
-	currentTerm     int           //当前任期
-	heartbeatTimers []*time.Timer //心跳定时器
-	eletionTimer    *time.Timer   //竞选超时定时器
-	randtime        *rand.Rand    //随机数，用于随机竞选周期，避免节点间竞争。
+	commitIndex    int         //当前日志提交处
+	lastApplied    int         //当前状态机执行处
+	status         int         //节点状态
+	currentTerm    int         //当前任期
+	heartbeatTimer *time.Timer //心跳定时器
+	eletionTimer   *time.Timer //竞选超时定时器
+	randtime       *rand.Rand  //随机数，用于随机竞选周期，避免节点间竞争。
 
 	nextIndex  []int //记录每个fallow的同步日志状态
 	matchIndex []int //记录每个fallow日志最大索引，0递增
@@ -137,7 +137,7 @@ func Make(peers []string, curNodeIndex int) *Raft {
 	raft.commitIndex = 0
 	raft.lastApplied = 0
 	raft.randtime = rand.New(rand.NewSource(time.Now().UnixNano() + int64(raft.curNodeIndex)))
-	raft.heartbeatTimers = make([]*time.Timer, len(raft.peers))
+	raft.heartbeatTimer = time.NewTimer(HeartbeatDuration)
 	raft.eletionTimer = time.NewTimer(CandidateDuration)
 	raft.nextIndex = make([]int, len(raft.peers))
 	raft.matchIndex = make([]int, len(raft.peers))
@@ -145,16 +145,10 @@ func Make(peers []string, curNodeIndex int) *Raft {
 	raft.EnableDebugLog = false
 
 	raft.lastLogs = AppendEntriesRequest{
-		Me:   -1,
-		Term: -1,
+		LeaderId: -1,
+		Term:     -1,
 	}
 
-	//日志同步协程
-	for i := 0; i < len(raft.peers); i++ {
-		raft.heartbeatTimers[i] = time.NewTimer(HeartbeatDuration)
-		go raft.replicateLogLoop(i)
-	}
-	go raft.electionLoop()
 	return raft
 }
 
@@ -173,19 +167,55 @@ func (raft *Raft) sendRequestVote(index int, request VoteRequest, response *Vote
 	return err
 }
 
+// 发送附加日志请求
+func (raft *Raft) sendRequestAppendEntries(index int, request AppendEntriesRequest, response *AppendEntriesResponse) error {
+	conn, err := jsonrpc.Dial("tcp", raft.peers[index])
+	if err != nil {
+		log.Fatalln("dailing error: ", err)
+		return err
+	}
+	defer func() {
+		err = conn.Close()
+		print(err)
+	}()
+	err = conn.Call("RaftRpc.AppendEntries", request, response)
+	return err
+}
+
+// 处理leader发送过来的日志追加请求（或者心跳）
+func (raft *Raft) dealAppendEntries(request AppendEntriesRequest, response *AppendEntriesResponse) {
+	response.Term = raft.currentTerm
+
+	if request.Term < raft.currentTerm {
+		response.Successed = false
+		response.Term = raft.currentTerm
+		response.LastApplied = 0
+		return
+	}
+
+	// 如果接受日志，则重置选举时间
+	raft.resetCandidateTimer()
+	log.Println("node: ", raft.curNodeIndex, " term: ", raft.currentTerm, "leaderTerm: ", request.Term, "get log and reset candidateTimer from", request.LeaderId)
+	raft.commitIndex = request.LeaderCommit
+	response.Successed = true
+	response.Term = raft.currentTerm
+	response.LastApplied = 0
+	return
+}
+
 // 处理其他节点发过来的投票请求
 func (raft *Raft) dealRequestVote(request VoteRequest, response *VoteResponse) {
 	response.IsAgree = true
 	response.CurrentTerm = raft.currentTerm
 	//竞选任期小于自身任期，则反对票
 	if (*response).CurrentTerm >= request.ElectionTerm {
-		log.Println(raft.curNodeIndex, "refuse", request.RequestNode, "because of term")
+		log.Println(raft.curNodeIndex, "refuse", request.CandidateId, "because of term")
 		response.IsAgree = false
 		return
 	}
 	raft.setStatus(Fallower)
 	raft.currentTerm = request.ElectionTerm
-	log.Println((*raft).curNodeIndex, "agree", request.RequestNode)
+	log.Println(raft.curNodeIndex, "agree", request.CandidateId)
 	raft.resetCandidateTimer()
 }
 
@@ -195,10 +225,10 @@ func (raft *Raft) Vote() {
 	log.Println("start vote :", raft.curNodeIndex, "term :", raft.currentTerm)
 	currentTerm := raft.currentTerm
 	req := VoteRequest{
-		RequestNode:  raft.curNodeIndex,
+		CandidateId:  raft.curNodeIndex,
 		ElectionTerm: currentTerm,
-		LogTerm:      0,
-		LogIndex:     0,
+		LastLogTerm:  0,
+		LastLogIndex: 0,
 	}
 	var wait sync.WaitGroup
 	nodeCount := len(raft.peers)
@@ -266,13 +296,32 @@ func (raft *Raft) electionLoop() {
 	}
 }
 
-// 日志复制
-func (raft *Raft) replicateLogLoop(peer int) {
+// 心跳循环
+func (raft *Raft) heartbeatLoop() {
 	defer func() {
-		raft.heartbeatTimers[peer].Stop()
+		raft.heartbeatTimer.Stop()
 	}()
 	for !raft.isKilled {
-		<-raft.heartbeatTimers[peer].C
+		<-raft.heartbeatTimer.C
+		raft.heartbeatTimer.Reset(HeartbeatDuration)
+		if raft.status == Leader {
+			for peer := 0; peer < len(raft.peers); peer++ {
+				if peer == raft.curNodeIndex {
+					continue
+				}
+				go func(dest int) {
+					request := AppendEntriesRequest{}
+					request.LeaderId = raft.curNodeIndex
+					request.Term = raft.currentTerm
+					request.Entries = nil
+					response := AppendEntriesResponse{Term: 0}
+					err := raft.sendRequestAppendEntries(dest, request, &response)
+					if err != nil {
+						return
+					}
+				}(peer)
+			}
+		}
 		if raft.isKilled {
 			break
 		}
@@ -301,9 +350,10 @@ func (raft *Raft) runLoop(signalChan chan os.Signal, endChan chan string) {
 func (raft *Raft) Run() {
 	signalChan := make(chan os.Signal, 2)
 	endChan := make(chan string)
-	go (*raft).electionLoop()
-	go (*raft).runLoop(signalChan, endChan)
-	go (*raft).runServer()
+	go raft.electionLoop()
+	go raft.heartbeatLoop()
+	go raft.runLoop(signalChan, endChan)
+	go raft.runServer()
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 	<-endChan
 }
