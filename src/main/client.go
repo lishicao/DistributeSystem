@@ -6,8 +6,8 @@ import (
 	"raft"
 )
 
-func Call(args raft.Params, reply *int) error {
-	conn, err := jsonrpc.Dial("tcp", "127.0.0.1:8888")
+func Call(args raft.PutRequest, reply *raft.PutResponse) error {
+	conn, err := jsonrpc.Dial("tcp", "127.0.0.1:8003")
 	if err != nil {
 		log.Fatalln("dailing error: ", err)
 		return err
@@ -19,17 +19,17 @@ func Call(args raft.Params, reply *int) error {
 	}()
 
 	// 调用远程的Calc的Compute方法
-	err = conn.Call("RaftRpc.Calc", args, &reply)
+	err = conn.Call("RaftRpc.Put", args, &reply)
 	return err
 }
 
 func main() {
-	params := raft.Params{123, 2}
-	var replay int
-	err := Call(params, &replay)
+	request := raft.PutRequest{"aaa", "bbb"}
+	response := raft.PutResponse{}
+	err := Call(request, &response)
 	if err != nil {
 		print(err)
 	}
 
-	print(replay)
+	print(response.ErrorCode)
 }

@@ -11,14 +11,54 @@ type RaftRpc struct {
 	raft *Raft
 }
 
-type Params struct {
-	A int
-	B int
+type GetRequest struct {
+	key string
 }
 
-func (raftRpc *RaftRpc) Calc(params Params, result *int) error {
-	*result = params.A + params.B
-	print(*result)
+type GetResponse struct {
+	ErrorCode      int
+	Result         string
+	RedirectAdress string
+}
+
+type PutRequest struct {
+	Key   string
+	Value string
+}
+
+type PutResponse struct {
+	ErrorCode      int
+	RedirectAdress string
+}
+
+// 对客户端提供的Get接口
+func (raftRpc *RaftRpc) Get(getRequest GetRequest, getResponse *GetResponse) error {
+	if raftRpc.raft.status != Leader {
+		getResponse.ErrorCode = -1 // 查询失败，需要重定向
+		getResponse.Result = ""
+		getResponse.RedirectAdress = raftRpc.raft.peers[raftRpc.raft.leaderIndex]
+	}
+	succ := raftRpc.raft.stateMachine.Get(getRequest.key, &getResponse.Result)
+	if succ {
+		getResponse.ErrorCode = 0
+	} else {
+		getResponse.ErrorCode = -2 // 查询失败，没有这个key
+	}
+	return nil
+}
+
+// 对客户端提供的Put接口
+func (raftRpc *RaftRpc) Put(putRequest PutRequest, putResponse *PutResponse) error {
+	if raftRpc.raft.status != Leader {
+		putResponse.ErrorCode = -1 // 插入失败，需要重定向
+		putResponse.RedirectAdress = raftRpc.raft.peers[raftRpc.raft.leaderIndex]
+	}
+	succ := raftRpc.raft.dealPutRequest(putRequest)
+	if succ {
+		putResponse.ErrorCode = 0
+	} else {
+		putResponse.ErrorCode = -3 //插入失败
+	}
 	return nil
 }
 

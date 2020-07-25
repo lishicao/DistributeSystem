@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"kvraft"
 	"raft"
 	"strconv"
 	"time"
@@ -24,6 +25,9 @@ func main() {
 	}
 	var raftNode *raft.Raft
 	time.Sleep(2 * time.Millisecond)
-	raftNode = raft.Make(peers, curNodeIndex)
+
+	machine := &kvraft.KvStateMachine{}
+	machine.Content = make(map[string]string, 0)
+	raftNode = raft.Make(peers, curNodeIndex, machine)
 	raftNode.Run()
 }

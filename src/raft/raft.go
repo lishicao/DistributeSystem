@@ -2,11 +2,14 @@ package raft
 
 import (
 	"fmt"
+	"kvraft"
 	"log"
+	"math"
 	"math/rand"
 	"net/rpc/jsonrpc"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -15,9 +18,9 @@ import (
 // 状态机接口
 type StateMachine interface {
 	// 应用到状态机
-	apply(entry LogEntry) bool
+	apply(key string, value string) bool
 	// 从状态机获取信息
-	get(entry LogEntry) string
+	get(key string, value *string) bool
 }
 
 //节点状态
@@ -52,19 +55,19 @@ type VoteResponse struct {
 
 //日志复制请求
 type AppendEntriesRequest struct {
-	LeaderId     int
-	Term         int
-	PrevLogTerm  int
-	PrevLogIndex int
-	Entries      []LogEntry
-	LeaderCommit int
+	LeaderId     int        //领导人的 Id，以便于跟随者重定向请求
+	Term         int        //领导人的任期号
+	PrevLogTerm  int        //prevLogIndex 条目的任期号
+	PrevLogIndex int        //新的日志条目紧随之前的索引值
+	Entries      []LogEntry //准备存储的日志条目（表示心跳时为空；一次性发送多个是为了提高效率）
+	LeaderCommit int        //领导人已经提交的日志的索引值
 }
 
 //回复日志更新请求
 type AppendEntriesResponse struct {
-	Term        int
-	Successed   bool
-	LastApplied int
+	Term      int  //当前的任期号，用于领导人去更新自己
+	Successed bool //跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的日志时为真
+	//LastApplied int			//已应用的索引
 }
 
 //设置当前节点状态
@@ -80,8 +83,8 @@ func (raft *Raft) setStatus(status int) {
 	if raft.status != Leader && status == Leader {
 		index := len(raft.logs)
 		for i := 0; i < len(raft.peers); i++ {
-			raft.nextIndex[i] = index + 1
-			raft.matchIndex[i] = 0
+			raft.nextIndex[i] = index
+			raft.matchIndex[i] = -1
 		}
 	}
 	raft.status = status
@@ -109,12 +112,14 @@ type Raft struct {
 	peers []string   // rpc节点，记录每个节点的ip:port
 	//persister       *Persister          // Object to hold this peer's persisted state
 	curNodeIndex int        // 自己服务编号
-	logs         []LogEntry // 日志存储
+	votedFor     int        // 在当前获得选票的候选人的Id
+	leaderIndex  int        // leader的服务编号
+	logs         []LogEntry // 日志存储 索引从0开始
 	//logSnapshot     LogSnapshot         //日志快照
-	commitIndex    int         //当前日志提交处
-	lastApplied    int         //当前状态机执行处
+	commitIndex    int         //已知的最大的已经被提交的日志条目的索引值，初始化为-1
+	lastApplied    int         //当前状态机执行处，初始化为-1
 	status         int         //节点状态
-	currentTerm    int         //当前任期
+	currentTerm    int         //服务器最后一次知道的任期号（初始化为 0，持续递增）
 	heartbeatTimer *time.Timer //心跳定时器
 	eletionTimer   *time.Timer //竞选超时定时器
 	randtime       *rand.Rand  //随机数，用于随机竞选周期，避免节点间竞争。
@@ -122,20 +127,21 @@ type Raft struct {
 	nextIndex  []int //记录每个fallow的同步日志状态
 	matchIndex []int //记录每个fallow日志最大索引，0递增
 	//applyCh        chan ApplyMsg //状态机apply
-	isKilled       bool                 //节点退出
-	lastLogs       AppendEntriesRequest //最后更新日志
-	EnableDebugLog bool                 //打印调试日志开关
+	stateMachine   *kvraft.KvStateMachine // 状态机
+	isKilled       bool                   //节点退出
+	lastLogs       AppendEntriesRequest   //最后更新日志
+	EnableDebugLog bool                   //打印调试日志开关
 	LastGetLock    string
 }
 
-func Make(peers []string, curNodeIndex int) *Raft {
+func Make(peers []string, curNodeIndex int, statusMachine *kvraft.KvStateMachine) *Raft {
 	raft := &Raft{}
 	raft.isKilled = false
 	raft.peers = peers
 	raft.curNodeIndex = curNodeIndex
 	raft.currentTerm = 0
-	raft.commitIndex = 0
-	raft.lastApplied = 0
+	raft.commitIndex = -1
+	raft.lastApplied = -1
 	raft.randtime = rand.New(rand.NewSource(time.Now().UnixNano() + int64(raft.curNodeIndex)))
 	raft.heartbeatTimer = time.NewTimer(HeartbeatDuration)
 	raft.eletionTimer = time.NewTimer(CandidateDuration)
@@ -143,6 +149,8 @@ func Make(peers []string, curNodeIndex int) *Raft {
 	raft.matchIndex = make([]int, len(raft.peers))
 	raft.setStatus(Fallower)
 	raft.EnableDebugLog = false
+	raft.stateMachine = statusMachine
+	raft.logs = make([]LogEntry, 0)
 
 	raft.lastLogs = AppendEntriesRequest{
 		LeaderId: -1,
@@ -186,20 +194,62 @@ func (raft *Raft) sendRequestAppendEntries(index int, request AppendEntriesReque
 func (raft *Raft) dealAppendEntries(request AppendEntriesRequest, response *AppendEntriesResponse) {
 	response.Term = raft.currentTerm
 
+	// 1 如果 term < currentTerm 就返回 false
 	if request.Term < raft.currentTerm {
 		response.Successed = false
 		response.Term = raft.currentTerm
-		response.LastApplied = 0
 		return
 	}
 
-	// 如果接受日志，则重置选举时间
+	// 重置选举时间
 	raft.resetCandidateTimer()
-	log.Println("node: ", raft.curNodeIndex, " term: ", raft.currentTerm, "leaderTerm: ", request.Term, "get log and reset candidateTimer from", request.LeaderId)
-	raft.commitIndex = request.LeaderCommit
+
+	// 2 如果日志在 prevLogIndex 位置处的日志条目的任期号和 prevLogTerm 不匹配，则返回 false （5.3 节）
+	if request.PrevLogIndex >= 0 && raft.logs[request.PrevLogIndex].Term != request.PrevLogTerm {
+		response.Successed = false
+		response.Term = raft.currentTerm
+		return
+	}
+
+	raft.setStatus(Fallower)
+
+	// 3 如果已经存在的日志条目和新的产生冲突（索引值相同但是任期号不同），删除这一条和之后所有的 （5.3 节）
+	for index := 0; index < len(request.Entries); index++ {
+		entry := request.Entries[index]
+		if entry.Index >= len(raft.logs) {
+			break
+		}
+
+		if raft.logs[entry.Index].Term != entry.Term {
+			// 冲突，删除这一条和之后所有的。
+			raft.logs = raft.logs[0:entry.Index]
+			break
+		}
+	}
+
+	// 4 附加日志中尚未存在的任何新条目  TODO:并发控制
+	for index := 0; index < len(request.Entries); index++ {
+		entry := request.Entries[index]
+		if entry.Index >= len(raft.logs) {
+			raft.logs = append(raft.logs, entry)
+			raft.logs[entry.Index] = entry
+			log.Println("node: ", raft.curNodeIndex, " leaderId: ", request.LeaderId, "recive log: ", entry.Log)
+		}
+	}
+
+	// 5 如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 新日志条目索引值中较小的一个
+	if request.LeaderCommit > raft.commitIndex {
+		if len(request.Entries) > 0 {
+			raft.commitIndex = int(math.Min(float64(request.LeaderCommit), float64(request.Entries[0].Index)))
+		} else {
+			raft.commitIndex = request.LeaderCommit
+		}
+
+	}
+
 	response.Successed = true
 	response.Term = raft.currentTerm
-	response.LastApplied = 0
+
 	return
 }
 
@@ -217,6 +267,73 @@ func (raft *Raft) dealRequestVote(request VoteRequest, response *VoteResponse) {
 	raft.currentTerm = request.ElectionTerm
 	log.Println(raft.curNodeIndex, "agree", request.CandidateId)
 	raft.resetCandidateTimer()
+}
+
+// 处理客户端的put请求
+func (raft *Raft) dealPutRequest(request PutRequest) bool {
+	logEntry := LogEntry{}
+	logEntry.Log = request.Key + "\t" + request.Value
+	logEntry.Term = raft.currentTerm
+	logEntry.Index = len(raft.logs)
+
+	succssNodeCount := 0
+	wg := sync.WaitGroup{}
+	wg.Add(len(raft.peers))
+
+	for i := 0; i < len(raft.peers); i++ {
+		if i == raft.curNodeIndex {
+			succssNodeCount += 1
+			wg.Done()
+			continue
+		}
+		go func(peer int) {
+			request := AppendEntriesRequest{}
+			request.LeaderCommit = raft.commitIndex
+			request.Term = raft.currentTerm
+			request.LeaderId = raft.curNodeIndex
+			if raft.matchIndex[peer] < 0 || len(raft.logs) == 0 {
+				request.PrevLogTerm = -1
+				request.PrevLogIndex = -1
+			} else {
+				request.PrevLogTerm = raft.logs[raft.matchIndex[peer]].Term
+				request.PrevLogIndex = raft.logs[raft.matchIndex[peer]].Index
+			}
+
+			if raft.nextIndex[peer] > len(raft.logs) {
+				request.Entries = raft.logs[len(raft.logs):]
+			} else {
+				request.Entries = raft.logs[raft.nextIndex[peer]:]
+			}
+			request.Entries = append(request.Entries, logEntry)
+
+			response := AppendEntriesResponse{}
+			err := raft.sendRequestAppendEntries(peer, request, &response)
+			if response.Term > raft.currentTerm {
+				raft.setStatus(Fallower)
+			}
+			if response.Successed == false {
+				raft.nextIndex[peer]--
+			} else {
+				raft.matchIndex[peer] = raft.nextIndex[peer]
+				raft.nextIndex[peer]++
+			}
+
+			wg.Done()
+			if err == nil && response.Successed == true {
+				succssNodeCount += 1
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if succssNodeCount > (len(raft.peers) / 2) {
+		// 复制到过半节点，主节点应用这个日志
+		raft.logs = append(raft.logs, logEntry)
+		raft.commitIndex += 1
+		return true
+	}
+	// 未复制到过半节点，失败
+	return false
 }
 
 // 发起投票
@@ -257,7 +374,6 @@ func (raft *Raft) Vote() {
 			if resp.CurrentTerm > term {
 				term = resp.CurrentTerm
 			}
-
 		}(i)
 	}
 
@@ -267,10 +383,10 @@ func (raft *Raft) Vote() {
 	if term > currentTerm {
 		log.Println(raft.curNodeIndex, "become fallower :", currentTerm)
 		raft.currentTerm = term
-		raft.status = Fallower
+		raft.setStatus(Fallower)
 	} else if agreeVote*2 > nodeCount { //获得多数赞同则变成leader
 		log.Println(raft.curNodeIndex, "become leader :", currentTerm)
-		raft.status = Leader
+		raft.setStatus(Leader)
 	}
 }
 
@@ -309,17 +425,48 @@ func (raft *Raft) heartbeatLoop() {
 				if peer == raft.curNodeIndex {
 					continue
 				}
-				go func(dest int) {
+				go func(peer int, raft *Raft) {
 					request := AppendEntriesRequest{}
-					request.LeaderId = raft.curNodeIndex
+					request.LeaderCommit = raft.commitIndex
 					request.Term = raft.currentTerm
-					request.Entries = nil
+					request.LeaderId = raft.curNodeIndex
+					if raft.matchIndex[peer] < 0 || len(raft.logs) == 0 {
+						request.PrevLogTerm = -1
+						request.PrevLogIndex = -1
+					} else {
+						log.Println("node: ", peer, "  len log:", raft.matchIndex[peer])
+						log.Println("log number: ", raft.logs[raft.matchIndex[peer]].Term)
+						request.PrevLogTerm = raft.logs[raft.matchIndex[peer]].Term
+						request.PrevLogIndex = raft.logs[raft.matchIndex[peer]].Index
+					}
+
+					if raft.nextIndex[peer] > len(raft.logs) {
+						request.Entries = raft.logs[len(raft.logs):]
+					} else {
+						request.Entries = raft.logs[raft.nextIndex[peer]:]
+					}
+
 					response := AppendEntriesResponse{Term: 0}
-					err := raft.sendRequestAppendEntries(dest, request, &response)
+					err := raft.sendRequestAppendEntries(peer, request, &response)
+
+					if response.Term > raft.currentTerm {
+						raft.setStatus(Fallower)
+						return
+					}
+
+					if response.Successed == false {
+						raft.nextIndex[peer]--
+						return
+					}
+
+					// 更新相应跟随者的 nextIndex 和 matchIndex
+					raft.matchIndex[peer] = len(raft.logs) - 1
+					raft.nextIndex[peer] = len(raft.logs)
+
 					if err != nil {
 						return
 					}
-				}(peer)
+				}(peer, raft)
 			}
 		}
 		if raft.isKilled {
@@ -333,6 +480,17 @@ func (raft *Raft) runLoop(signalChan chan os.Signal, endChan chan string) {
 	fmt.Println("start run loop")
 	for {
 		time.Sleep(500000) // 10毫秒
+		if raft.lastApplied < raft.commitIndex && raft.commitIndex >= 0 {
+			entry := raft.logs[raft.lastApplied+1]
+			string_slice := strings.Split(entry.Log, "\t")
+			if len(string_slice) == 2 {
+				key := string_slice[0]
+				value := string_slice[1]
+				raft.stateMachine.Apply(key, value)
+				log.Println("apply to state machine key: ", key, " value: ", value)
+			}
+			raft.lastApplied++
+		}
 		select {
 		case msg := <-signalChan:
 			fmt.Println(msg)
