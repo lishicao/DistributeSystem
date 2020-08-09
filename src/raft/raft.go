@@ -124,9 +124,8 @@ type Raft struct {
 	eletionTimer   *time.Timer //竞选超时定时器
 	randtime       *rand.Rand  //随机数，用于随机竞选周期，避免节点间竞争。
 
-	nextIndex  []int //记录每个fallow的同步日志状态
-	matchIndex []int //记录每个fallow日志最大索引，0递增
-	//applyCh        chan ApplyMsg //状态机apply
+	nextIndex      []int                  //记录每个fallow的同步日志状态
+	matchIndex     []int                  //记录每个fallow日志最大索引，0递增
 	stateMachine   *kvraft.KvStateMachine // 状态机
 	isKilled       bool                   //节点退出
 	lastLogs       AppendEntriesRequest   //最后更新日志
@@ -260,6 +259,12 @@ func (raft *Raft) dealRequestVote(request VoteRequest, response *VoteResponse) {
 	//竞选任期小于自身任期，则反对票
 	if (*response).CurrentTerm >= request.ElectionTerm {
 		log.Println(raft.curNodeIndex, "refuse", request.CandidateId, "because of term")
+		response.IsAgree = false
+		return
+	}
+	//如果候选人的日志没有自己新，则反对
+	if request.LastLogTerm < raft.currentTerm || (request.LastLogTerm == raft.currentTerm && request.LastLogIndex < raft.commitIndex) {
+		log.Println(raft.curNodeIndex, "refuse", request.CandidateId, "because log is old")
 		response.IsAgree = false
 		return
 	}
